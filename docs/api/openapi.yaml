@@ -1,0 +1,867 @@
+openapi: 3.0.3
+info:
+  title: РесурсБронь API
+  version: 0.1.0
+  description: |
+    REST API сервиса бронирования аудиторий и оборудования. Job — бронь одного ресурса на интервал [start, end).
+    Состояния и переходы Job — docs/job-states.md, сценарии и ошибки E1–E27 — docs/requirements.md.
+
+    Общие правила контракта:
+    - Все тела запросов и ответов — `application/json; charset=utf-8`. Другой `Content-Type` → `415 unsupported_media_type`.
+    - Максимальный размер тела запроса — 16 КБ. Больше → `413 payload_too_large`, тело не разбирается, Job не создаётся.
+    - Время — ISO 8601 с обязательным смещением, например `2026-11-20T10:00:00+05:00`. Сервис принимает любое смещение,
+      хранит UTC и отвечает в часовом поясе организации (Asia/Yekaterinburg, +05:00). Время без смещения → `400 invalid_params`.
+    - Неизвестные поля в теле запроса → `400 invalid_params` с именем поля в `error.field`.
+    - Неизвестный путь → `404 route_not_found`, неподдерживаемый метод → `405 method_not_allowed`, оба в едином формате ошибки.
+    - Чужая и несуществующая бронь неразличимы: `404 booking_not_found` с одинаковым телом (E13, E16, E23).
+    - Каждый ответ содержит заголовок `X-Request-Id`; то же значение — в `error.requestId`.
+    - Списки постраничные: `limit` от 1 до 100 (по умолчанию 20), продолжение — по `nextCursor`.
+servers:
+  - url: http://localhost:8080
+    description: Локальный запуск через docker compose
+security:
+  - bearerAuth: []
+tags:
+  - name: resources
+    description: Поиск ресурсов (S1)
+  - name: bookings
+    description: Брони пользователя (S2, S3, S5)
+  - name: responsible
+    description: Работа ответственного за ресурс (S4)
+  - name: service
+    description: Служебные операции
+
+paths:
+  /api/resources:
+    get:
+      tags: [resources]
+      operationId: searchResources
+      summary: Найти свободные ресурсы на интервал (S1)
+      description: |
+        Возвращает ресурсы нужного типа, доступные пользователю по правам, открытые на всём интервале и не занятые
+        бронями `confirmed` или `used` на пересекающемся интервале. Бронь `requested` интервал не занимает.
+        Результат актуален на момент запроса; при подтверждении брони проверки выполняются заново.
+      parameters:
+        - name: type
+          in: query
+          required: true
+          schema:
+            $ref: '#/components/schemas/ResourceType'
+        - name: start
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date-time
+        - name: end
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date-time
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Свободные ресурсы
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResourcePage'
+        '400':
+          description: |
+            - `invalid_params` — нет параметра, неверный тип или формат; поле в `error.field`
+            - `unknown_resource_type` — такого типа ресурса нет; `error.field` = `type`, в `details.allowed` — допустимые
+            - `invalid_interval` — `end` не позже `start` (E1); `error.field` = `end`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                invalidInterval:
+                  $ref: '#/components/examples/InvalidInterval'
+                unknownType:
+                  $ref: '#/components/examples/UnknownResourceType'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/bookings:
+    post:
+      tags: [bookings]
+      operationId: createBooking
+      summary: Запросить бронь — создать Job (S2)
+      description: |
+        Синхронно проверяет формат, существование ресурса и интервал. Для корректного запроса создаёт Job в состоянии
+        `requested` и сразу отвечает `202`. Права, часы доступности, пересечения и лимит проверяются в фоне
+        (ADR-0001); итог клиент видит через `GET /api/bookings/{id}`.
+
+        Повтор (ADR-0003): ключ `Idempotency-Key` действует в пределах пользователя 24 часа с первого принятия запроса.
+        - тот же ключ и те же `resourceId`, `start`, `end` → `200` с исходной бронью в её текущем состоянии,
+          даже если интервал уже начался или Job конечный (E5, К1, К2, К5);
+        - тот же ключ, другие параметры → `409 idempotency_key_conflict`, исходная бронь не меняется;
+        - после 24 часов ключ обрабатывается как новый.
+
+        При ошибке синхронной проверки Job не создаётся и ключ не запоминается.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBookingRequest'
+            example:
+              resourceId: 6f1c2a9e-1d3b-4a51-9a0e-2b7c5d8e9f10
+              start: '2026-11-20T10:00:00+05:00'
+              end: '2026-11-20T11:00:00+05:00'
+      responses:
+        '202':
+          description: Job создан в состоянии `requested`, проверка идёт в фоне
+          headers:
+            Location:
+              description: Адрес брони, например `/api/bookings/{id}`
+              schema:
+                type: string
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '200':
+          description: Повтор с тем же ключом и параметрами — исходная бронь, новый Job не создан
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '400':
+          description: |
+            - `missing_idempotency_key` — нет заголовка; `error.field` = `Idempotency-Key`
+            - `invalid_params` — нет поля, неверный тип, формат, лишнее поле или неверный формат ключа; поле в `error.field` (E8)
+            - `invalid_interval` — `end` не позже `start`; `error.field` = `end` (E8)
+            - `interval_started` — `start` не позже текущего времени; `error.field` = `start` (E8)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                missingField:
+                  $ref: '#/components/examples/MissingField'
+                intervalStarted:
+                  $ref: '#/components/examples/IntervalStarted'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          description: '`resource_not_found` — ресурса с таким `resourceId` нет (E8); `error.field` = `resourceId`'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: '`idempotency_key_conflict` — ключ уже использован этим пользователем с другими параметрами; в `details.bookingId` — исходная бронь'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: idempotency_key_conflict
+                  message: Ключ повтора уже использован с другим ресурсом или интервалом
+                  field: Idempotency-Key
+                  details:
+                    bookingId: 0b5e7c1a-8f2d-4c6e-9a3b-1d2e3f4a5b6c
+                  requestId: 3f2a9c4e7b1d
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '429':
+          description: |
+            - `too_many_pending_requests` — у пользователя уже 5 броней в состоянии `requested`; `details.limit` = 5
+            - `rate_limited` — больше 30 запросов в минуту от пользователя; заголовок `Retry-After`
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    get:
+      tags: [bookings]
+      operationId: listMyBookings
+      summary: Мои брони во всех состояниях (S5)
+      description: |
+        Только брони текущего пользователя. Сначала текущие и будущие (`requested`, `confirmed`, `used` до окончания)
+        по возрастанию `start`, затем завершённые. Статус читается в момент запроса и не зависит от доставки писем.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Страница броней; пустой список, если броней нет
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingPage'
+        '400':
+          $ref: '#/components/responses/InvalidParams'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/bookings/{bookingId}:
+    parameters:
+      - $ref: '#/components/parameters/BookingId'
+    get:
+      tags: [bookings]
+      operationId: getBooking
+      summary: Состояние брони
+      description: Доступно владельцу брони. Для чужой и несуществующей брони ответ одинаковый (E23).
+      responses:
+        '200':
+          description: Бронь
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '400':
+          $ref: '#/components/responses/InvalidParams'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/BookingNotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/bookings/{bookingId}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/BookingId'
+    post:
+      tags: [bookings]
+      operationId: cancelBooking
+      summary: Отменить подтверждённую бронь (S3)
+      description: |
+        Только владелец, только из `confirmed`, только если момент сохранения строго раньше `start`.
+        Повтор для уже `cancelled` → `200` с текущей бронью без нового перехода и письма (E14).
+        Запрос в состоянии `requested` отменить нельзя (ADR-0004). Тело запроса не нужно.
+      responses:
+        '200':
+          description: Бронь в состоянии `cancelled`
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '400':
+          $ref: '#/components/responses/InvalidParams'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/BookingNotFound'
+        '409':
+          description: |
+            - `invalid_state` — бронь не в `confirmed` (E15); `details.currentStatus`
+            - `cancel_window_closed` — интервал уже начался (E12, E21); `details.start`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                invalidState:
+                  $ref: '#/components/examples/InvalidStateCancel'
+                windowClosed:
+                  $ref: '#/components/examples/CancelWindowClosed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/bookings/{bookingId}/check-in:
+    parameters:
+      - $ref: '#/components/parameters/BookingId'
+    post:
+      tags: [responsible]
+      operationId: checkInBooking
+      summary: Отметить использование брони (S4)
+      description: |
+        Только сотрудник, закреплённый за ресурсом брони; только из `confirmed`; момент сохранения в [start, end).
+        Повтор для уже `used` → `200` с текущей бронью (E19). Тело запроса не нужно.
+        Если пользователь не закреплён за ресурсом, ответ одинаков для брони в любом состоянии — `404` (E16).
+      responses:
+        '200':
+          description: Бронь в состоянии `used`
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '400':
+          $ref: '#/components/responses/InvalidParams'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/BookingNotFound'
+        '409':
+          description: |
+            - `invalid_state` — бронь не в `confirmed` (E20); `details.currentStatus`
+            - `check_in_too_early` — интервал ещё не начался (E17); `details.start`
+            - `check_in_window_closed` — интервал уже закончился (E18, E22); `details.end`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: check_in_too_early
+                  message: Отметка доступна с 10:00
+                  field: null
+                  details:
+                    start: '2026-11-20T10:00:00+05:00'
+                  requestId: 7c1e2d3f4a5b
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/managed-resources/{resourceId}/bookings:
+    parameters:
+      - name: resourceId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [responsible]
+      operationId: listResourceBookings
+      summary: Подтверждённые брони закреплённого ресурса (S4)
+      description: |
+        Брони в состоянии `confirmed` ресурса, за которым закреплён текущий пользователь, по возрастанию `start`.
+        Если пользователь не закреплён за ресурсом или ресурса нет — `404 resource_not_found`, одинаково в обоих случаях.
+      parameters:
+        - name: from
+          in: query
+          required: false
+          description: Начало периода, по умолчанию — текущий момент
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: false
+          description: Конец периода, по умолчанию — `from` + 7 дней; не больше 31 дня от `from`
+          schema:
+            type: string
+            format: date-time
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Страница броней ресурса
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingPage'
+        '400':
+          description: '`invalid_params` — неверный формат; `invalid_interval` — `to` не позже `from` или период длиннее 31 дня'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          description: '`resource_not_found`'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /health:
+    get:
+      tags: [service]
+      operationId: health
+      summary: Доступность API и PostgreSQL
+      security: []
+      responses:
+        '200':
+          description: Сервис и база доступны
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '503':
+          description: База недоступна
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  headers:
+    X-Request-Id:
+      description: Идентификатор запроса для логов; совпадает с `error.requestId`
+      schema:
+        type: string
+
+  parameters:
+    BookingId:
+      name: bookingId
+      in: path
+      required: true
+      description: Идентификатор брони. Не UUID → `400 invalid_params`, `error.field` = `bookingId`
+      schema:
+        type: string
+        format: uuid
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Ключ повтора, генерирует клиент для каждой новой попытки бронирования (ADR-0003)
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 64
+        pattern: '^[A-Za-z0-9_-]+$'
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Значение `nextCursor` из предыдущей страницы
+      schema:
+        type: string
+        maxLength: 200
+
+  schemas:
+    ResourceType:
+      type: string
+      enum: [room, equipment]
+      description: '`room` — аудитория, `equipment` — оборудование'
+
+    BookingStatus:
+      type: string
+      enum: [requested, confirmed, rejected, timed_out, cancelled, used, expired]
+      description: |
+        `requested` — Запрошена, `confirmed` — Подтверждена, `rejected` — Отклонена, `timed_out` — Просрочена,
+        `cancelled` — Отменена, `used` — Использована, `expired` — Истекла. Переходы — docs/job-states.md.
+
+    ReasonCode:
+      type: string
+      enum:
+        - interval_taken
+        - limit_exceeded
+        - no_permission
+        - outside_availability
+        - check_not_completed
+        - usage_not_marked
+      description: |
+        Причина для `rejected`, `timed_out`, `expired`:
+        `interval_taken` — «Интервал занят», `limit_exceeded` — «Превышен лимит»,
+        `no_permission` — «Нет права на бронирование», `outside_availability` — «Вне часов доступности ресурса»,
+        `check_not_completed` — «Проверка не завершена до начала интервала», `usage_not_marked` — «Использование не отмечено».
+
+    Resource:
+      type: object
+      required: [id, name, type]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          example: Аудитория Р-237
+        type:
+          $ref: '#/components/schemas/ResourceType'
+        location:
+          type: string
+          nullable: true
+          example: Главный корпус, 2 этаж
+
+    ResourcePage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Resource'
+        nextCursor:
+          type: string
+          nullable: true
+
+    CreateBookingRequest:
+      type: object
+      additionalProperties: false
+      required: [resourceId, start, end]
+      properties:
+        resourceId:
+          type: string
+          format: uuid
+        start:
+          type: string
+          format: date-time
+        end:
+          type: string
+          format: date-time
+
+    Booking:
+      type: object
+      required: [id, resource, start, end, status, reason, canCancel, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        resource:
+          $ref: '#/components/schemas/Resource'
+        start:
+          type: string
+          format: date-time
+          description: В часовом поясе организации
+        end:
+          type: string
+          format: date-time
+        status:
+          $ref: '#/components/schemas/BookingStatus'
+        reason:
+          type: object
+          nullable: true
+          description: Заполнено для `rejected`, `timed_out`, `expired`, иначе `null`
+          required: [code, message]
+          properties:
+            code:
+              $ref: '#/components/schemas/ReasonCode'
+            message:
+              type: string
+              example: Интервал занят
+        canCancel:
+          type: boolean
+          description: '`true` только для `confirmed` до начала интервала (S5)'
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+      example:
+        id: 0b5e7c1a-8f2d-4c6e-9a3b-1d2e3f4a5b6c
+        resource:
+          id: 6f1c2a9e-1d3b-4a51-9a0e-2b7c5d8e9f10
+          name: Аудитория Р-237
+          type: room
+          location: Главный корпус, 2 этаж
+        start: '2026-11-20T10:00:00+05:00'
+        end: '2026-11-20T11:00:00+05:00'
+        status: rejected
+        reason:
+          code: interval_taken
+          message: Интервал занят
+        canCancel: false
+        createdAt: '2026-11-19T15:02:11+05:00'
+        updatedAt: '2026-11-19T15:02:12+05:00'
+
+    BookingPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Booking'
+        nextCursor:
+          type: string
+          nullable: true
+
+    Health:
+      type: object
+      required: [status, checks]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        checks:
+          type: object
+          required: [database]
+          properties:
+            database:
+              type: string
+              enum: [ok, unavailable]
+
+    ErrorCode:
+      type: string
+      enum:
+        - invalid_params
+        - missing_idempotency_key
+        - unknown_resource_type
+        - invalid_interval
+        - interval_started
+        - unauthenticated
+        - resource_not_found
+        - booking_not_found
+        - route_not_found
+        - method_not_allowed
+        - idempotency_key_conflict
+        - invalid_state
+        - cancel_window_closed
+        - check_in_too_early
+        - check_in_window_closed
+        - payload_too_large
+        - unsupported_media_type
+        - too_many_pending_requests
+        - rate_limited
+        - internal_error
+        - service_unavailable
+
+    Error:
+      type: object
+      description: Единый формат ошибки для всех операций и кодов 4xx и 5xx
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, field, details, requestId]
+          properties:
+            code:
+              $ref: '#/components/schemas/ErrorCode'
+            message:
+              type: string
+              description: Текст для человека на русском; клиент ветвится по `code`, а не по `message`
+            field:
+              type: string
+              nullable: true
+              description: Первое поле, параметр или заголовок с ошибкой; `null`, если ошибка не относится к полю
+            details:
+              type: object
+              nullable: true
+              description: |
+                Дополнительные данные по коду. Для `invalid_params` — `violations`: все неверные поля.
+                Для `invalid_state` — `currentStatus`. Для окон времени — `start` или `end`.
+              properties:
+                violations:
+                  type: array
+                  items:
+                    type: object
+                    required: [field, problem]
+                    properties:
+                      field:
+                        type: string
+                      problem:
+                        type: string
+                        enum: [required, wrong_type, wrong_format, out_of_range, unknown_field]
+                currentStatus:
+                  $ref: '#/components/schemas/BookingStatus'
+                start:
+                  type: string
+                  format: date-time
+                end:
+                  type: string
+                  format: date-time
+                bookingId:
+                  type: string
+                  format: uuid
+                allowed:
+                  type: array
+                  items:
+                    type: string
+                limit:
+                  type: integer
+              additionalProperties: true
+            requestId:
+              type: string
+
+  examples:
+    MissingField:
+      summary: Нет обязательного поля
+      value:
+        error:
+          code: invalid_params
+          message: 'Поле start обязательно'
+          field: start
+          details:
+            violations:
+              - field: start
+                problem: required
+          requestId: 9a8b7c6d5e4f
+    InvalidInterval:
+      summary: Окончание не позже начала (E1)
+      value:
+        error:
+          code: invalid_interval
+          message: Время окончания должно быть позже времени начала
+          field: end
+          details: null
+          requestId: 1a2b3c4d5e6f
+    IntervalStarted:
+      summary: Интервал уже начался (E8)
+      value:
+        error:
+          code: interval_started
+          message: Бронь можно запросить только до начала интервала
+          field: start
+          details: null
+          requestId: 2b3c4d5e6f7a
+    UnknownResourceType:
+      summary: Неизвестный тип ресурса
+      value:
+        error:
+          code: unknown_resource_type
+          message: 'Тип ресурса projector не поддерживается'
+          field: type
+          details:
+            allowed: [room, equipment]
+          requestId: 3c4d5e6f7a8b
+    InvalidStateCancel:
+      summary: Отмена не подтверждённой брони (E15)
+      value:
+        error:
+          code: invalid_state
+          message: Отменить можно только подтверждённую бронь
+          field: null
+          details:
+            currentStatus: requested
+          requestId: 4d5e6f7a8b9c
+    CancelWindowClosed:
+      summary: Отмена после начала интервала (E12)
+      value:
+        error:
+          code: cancel_window_closed
+          message: Отмена возможна только до начала интервала
+          field: null
+          details:
+            start: '2026-11-20T10:00:00+05:00'
+          requestId: 5e6f7a8b9c0d
+
+  responses:
+    InvalidParams:
+      description: '`invalid_params` — неверный параметр запроса; поле в `error.field`'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: invalid_params
+              message: 'limit должен быть от 1 до 100'
+              field: limit
+              details:
+                violations:
+                  - field: limit
+                    problem: out_of_range
+              requestId: 6f7a8b9c0d1e
+    Unauthenticated:
+      description: '`unauthenticated` — нет токена, токен неверен или истёк (E24); данные не возвращаются'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: unauthenticated
+              message: Сессия истекла, войдите заново
+              field: null
+              details: null
+              requestId: 7a8b9c0d1e2f
+    BookingNotFound:
+      description: '`booking_not_found` — брони нет или она недоступна этому пользователю; тело одинаково в обоих случаях'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: booking_not_found
+              message: Бронь не найдена
+              field: null
+              details: null
+              requestId: 8b9c0d1e2f3a
+    PayloadTooLarge:
+      description: '`payload_too_large` — тело больше 16 КБ; тело не разбирается'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    UnsupportedMediaType:
+      description: '`unsupported_media_type` — тело не `application/json`'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    RateLimited:
+      description: '`rate_limited` — превышена частота запросов; заголовок `Retry-After`'
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    InternalError:
+      description: '`internal_error` — непредвиденная ошибка; подробности только в логах по `requestId`'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    ServiceUnavailable:
+      description: '`service_unavailable` — PostgreSQL недоступен; изменения не сохранены, запрос можно повторить с тем же ключом'
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
