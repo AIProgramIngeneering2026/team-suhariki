@@ -15,4 +15,10 @@
 ## Документы
 
 - [Требования и жизненный цикл Job](docs/requirements.md)
+- [Архитектура: контекст и компоненты](docs/architecture.md)
+- [Состояния Job](docs/job-states.md)
+- [Контракт API (OpenAPI 3)](docs/api/openapi.yaml)
+- [Контракт Tool](docs/tool-contract.md)
+- [Архитектурные решения (ADR)](docs/adr/)
+- [Проверка контракта колодой](docs/contract-check.md)
 - [Правила работы через PR](CONTRIBUTING.md)
