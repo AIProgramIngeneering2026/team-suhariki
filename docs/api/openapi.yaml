@@ -4,17 +4,25 @@ info:
   version: 0.1.0
   description: |
     REST API сервиса бронирования аудиторий и оборудования. Job — бронь одного ресурса на интервал [start, end).
-    Состояния и переходы Job — docs/job-states.md, сценарии и ошибки E1–E27 — docs/requirements.md.
+    Состояния и переходы Job — docs/job-states.md, сценарии и ошибки E1–E28 — docs/requirements.md.
 
     Общие правила контракта:
     - Все тела запросов и ответов — `application/json; charset=utf-8`. Другой `Content-Type` → `415 unsupported_media_type`.
     - Максимальный размер тела запроса — 16 КБ. Больше → `413 payload_too_large`, тело не разбирается, Job не создаётся.
+    - Операции без тела (`cancel`, `check-in`) тело не принимают: непустое тело → `400 invalid_params`,
+      `error.field` = `body`, состояние брони не меняется.
     - Время — ISO 8601 с обязательным смещением, например `2026-11-20T10:00:00+05:00`. Сервис принимает любое смещение,
       хранит UTC и отвечает в часовом поясе организации (Asia/Yekaterinburg, +05:00). Время без смещения → `400 invalid_params`.
+    - «Текущее время» во всех проверках — и синхронных, и при сохранении переходов — берётся из часов PostgreSQL
+      (`clock_timestamp()`), а не из часов экземпляра приложения (ADR-0005).
     - Неизвестные поля в теле запроса → `400 invalid_params` с именем поля в `error.field`.
     - Неизвестный путь → `404 route_not_found`, неподдерживаемый метод → `405 method_not_allowed`, оба в едином формате ошибки.
     - Чужая и несуществующая бронь неразличимы: `404 booking_not_found` с одинаковым телом (E13, E16, E23).
-    - Каждый ответ содержит заголовок `X-Request-Id`; то же значение — в `error.requestId`.
+    - Не больше 30 запросов в минуту от пользователя на все операции с авторизацией. Больше → `429 rate_limited`
+      с заголовком `Retry-After` в секундах.
+    - Каждый ответ содержит заголовок `X-Request-Id`; в ошибках то же значение — в `error.requestId`.
+    - Все ошибки 4xx и 5xx — в едином формате `Error`. Единственное исключение — служебный `/health`: его `503`
+      возвращает тело `Health`, чтобы проверка доступности не зависела от формата ошибок API.
     - Списки постраничные: `limit` от 1 до 100 (по умолчанию 20), продолжение — по `nextCursor`.
 servers:
   - url: http://localhost:8080
@@ -104,13 +112,25 @@ paths:
         `requested` и сразу отвечает `202`. Права, часы доступности, пересечения и лимит проверяются в фоне
         (ADR-0001); итог клиент видит через `GET /api/bookings/{id}`.
 
+        Порядок проверок; первая неудачная определяет ответ:
+        1. Токен → `401`; частота запросов → `429 rate_limited`.
+        2. Размер и тип тела → `413`, `415`.
+        3. Заголовок `Idempotency-Key`: нет → `400 missing_idempotency_key`, неверный формат → `400 invalid_params`.
+        4. Поиск ключа. Найден — ответ по правилам повтора ниже, остальные проверки не выполняются.
+        5. Формат тела → `400 invalid_params`; ресурс → `404 resource_not_found`; интервал → `400 invalid_interval`,
+           `400 interval_started`.
+        6. Число броней `requested` у пользователя → `429 too_many_pending_requests`.
+
         Повтор (ADR-0003): ключ `Idempotency-Key` действует в пределах пользователя 24 часа с первого принятия запроса.
+        Параметры сравниваются после приведения `start` и `end` к UTC: `10:00+05:00` и `05:00Z` — одинаковые параметры.
         - тот же ключ и те же `resourceId`, `start`, `end` → `200` с исходной бронью в её текущем состоянии,
           даже если интервал уже начался или Job конечный (E5, К1, К2, К5);
-        - тот же ключ, другие параметры → `409 idempotency_key_conflict`, исходная бронь не меняется;
+        - тот же ключ, другие параметры → `409 idempotency_key_conflict`, даже если новые параметры невалидны;
+          исходная бронь не меняется;
         - после 24 часов ключ обрабатывается как новый.
 
-        При ошибке синхронной проверки Job не создаётся и ключ не запоминается.
+        При любом ответе, при котором Job не создан (`4xx`, `5xx`), ключ не запоминается: исправленный запрос
+        с тем же ключом обрабатывается как новый.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -151,7 +171,7 @@ paths:
             - `missing_idempotency_key` — нет заголовка; `error.field` = `Idempotency-Key`
             - `invalid_params` — нет поля, неверный тип, формат, лишнее поле или неверный формат ключа; поле в `error.field` (E8)
             - `invalid_interval` — `end` не позже `start`; `error.field` = `end` (E8)
-            - `interval_started` — `start` не позже текущего времени; `error.field` = `start` (E8)
+            - `interval_started` — `start` не позже текущего времени по часам БД; `error.field` = `start` (E8)
           content:
             application/json:
               schema:
@@ -189,10 +209,14 @@ paths:
           $ref: '#/components/responses/UnsupportedMediaType'
         '429':
           description: |
-            - `too_many_pending_requests` — у пользователя уже 5 броней в состоянии `requested`; `details.limit` = 5
+            - `too_many_pending_requests` — у пользователя уже 5 броней в состоянии `requested` (E28); `details.limit` = 5.
+              Число считается под блокировкой пользователя в одной транзакции с созданием Job, поэтому параллельные
+              запросы не создадут шестую. `Retry-After` не передаётся: когда завершится проверка, заранее неизвестно,
+              клиент ждёт итога своих запросов через `GET /api/bookings`.
             - `rate_limited` — больше 30 запросов в минуту от пользователя; заголовок `Retry-After`
           headers:
             Retry-After:
+              description: Только для `rate_limited` — через сколько секунд можно повторить
               schema:
                 type: integer
           content:
@@ -209,7 +233,14 @@ paths:
       summary: Мои брони во всех состояниях (S5)
       description: |
         Только брони текущего пользователя. Сначала текущие и будущие (`requested`, `confirmed`, `used` до окончания)
-        по возрастанию `start`, затем завершённые. Статус читается в момент запроса и не зависит от доставки писем.
+        по возрастанию `start`, затем завершённые по убыванию `start`. Статус читается в момент запроса
+        и не зависит от доставки писем.
+
+        Курсор кодирует позицию `(группа, start, id)` последнего элемента страницы. Бронь переходит только
+        из текущих в завершённые, обратно — никогда, поэтому при листании она не теряется, но может встретиться
+        дважды: на ранней странице как текущая и на поздней как завершённая. Клиент убирает повторы по `id`
+        и показывает последний полученный статус. Брони, созданные после запроса первой страницы, видны
+        при следующем открытии списка.
       parameters:
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
@@ -227,6 +258,8 @@ paths:
           $ref: '#/components/responses/InvalidParams'
         '401':
           $ref: '#/components/responses/Unauthenticated'
+        '429':
+          $ref: '#/components/responses/RateLimited'
         '500':
           $ref: '#/components/responses/InternalError'
         '503':
@@ -256,6 +289,8 @@ paths:
           $ref: '#/components/responses/Unauthenticated'
         '404':
           $ref: '#/components/responses/BookingNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
         '500':
           $ref: '#/components/responses/InternalError'
         '503':
@@ -271,7 +306,8 @@ paths:
       description: |
         Только владелец, только из `confirmed`, только если момент сохранения строго раньше `start`.
         Повтор для уже `cancelled` → `200` с текущей бронью без нового перехода и письма (E14).
-        Запрос в состоянии `requested` отменить нельзя (ADR-0004). Тело запроса не нужно.
+        Запрос в состоянии `requested` отменить нельзя (ADR-0004).
+        Тело запроса не принимается: непустое тело → `400 invalid_params`, `error.field` = `body`.
       responses:
         '200':
           description: Бронь в состоянии `cancelled`
@@ -301,6 +337,8 @@ paths:
                   $ref: '#/components/examples/InvalidStateCancel'
                 windowClosed:
                   $ref: '#/components/examples/CancelWindowClosed'
+        '429':
+          $ref: '#/components/responses/RateLimited'
         '500':
           $ref: '#/components/responses/InternalError'
         '503':
@@ -315,18 +353,19 @@ paths:
       summary: Отметить использование брони (S4)
       description: |
         Только сотрудник, закреплённый за ресурсом брони; только из `confirmed`; момент сохранения в [start, end).
-        Повтор для уже `used` → `200` с текущей бронью (E19). Тело запроса не нужно.
+        Повтор для уже `used` → `200` с текущей бронью (E19).
+        Тело запроса не принимается: непустое тело → `400 invalid_params`, `error.field` = `body`.
         Если пользователь не закреплён за ресурсом, ответ одинаков для брони в любом состоянии — `404` (E16).
       responses:
         '200':
-          description: Бронь в состоянии `used`
+          description: Бронь в состоянии `used`, с владельцем — как в списке ответственного
           headers:
             X-Request-Id:
               $ref: '#/components/headers/X-Request-Id'
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Booking'
+                $ref: '#/components/schemas/ManagedBooking'
         '400':
           $ref: '#/components/responses/InvalidParams'
         '401':
@@ -350,6 +389,8 @@ paths:
                   details:
                     start: '2026-11-20T10:00:00+05:00'
                   requestId: 7c1e2d3f4a5b
+        '429':
+          $ref: '#/components/responses/RateLimited'
         '500':
           $ref: '#/components/responses/InternalError'
         '503':
@@ -369,6 +410,8 @@ paths:
       summary: Подтверждённые брони закреплённого ресурса (S4)
       description: |
         Брони в состоянии `confirmed` ресурса, за которым закреплён текущий пользователь, по возрастанию `start`.
+        В период попадают брони, интервал которых пересекается с `[from, to)`: `end > from` и `start < to`.
+        Поэтому бронь 10:00–11:00 видна в 10:05 при `from` по умолчанию — её как раз можно отметить (S4).
         Если пользователь не закреплён за ресурсом или ресурса нет — `404 resource_not_found`, одинаково в обоих случаях.
       parameters:
         - name: from
@@ -389,14 +432,14 @@ paths:
         - $ref: '#/components/parameters/Cursor'
       responses:
         '200':
-          description: Страница броней ресурса
+          description: Страница броней ресурса с владельцами
           headers:
             X-Request-Id:
               $ref: '#/components/headers/X-Request-Id'
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/BookingPage'
+                $ref: '#/components/schemas/ManagedBookingPage'
         '400':
           description: '`invalid_params` — неверный формат; `invalid_interval` — `to` не позже `from` или период длиннее 31 дня'
           content:
@@ -411,6 +454,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
         '500':
           $ref: '#/components/responses/InternalError'
         '503':
@@ -421,16 +466,25 @@ paths:
       tags: [service]
       operationId: health
       summary: Доступность API и PostgreSQL
+      description: |
+        Служебная проверка для `docker compose` и мониторинга. Исключение из единого формата ошибок:
+        `503` возвращает тело `Health`, а не `Error`. Ограничение частоты запросов на `/health` не действует.
       security: []
       responses:
         '200':
           description: Сервис и база доступны
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Health'
         '503':
           description: База недоступна
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
           content:
             application/json:
               schema:
@@ -621,6 +675,54 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Booking'
+        nextCursor:
+          type: string
+          nullable: true
+
+    ManagedBooking:
+      type: object
+      description: |
+        Бронь глазами ответственного за ресурс: с владельцем, без `canCancel` (отменяет только владелец) и без `reason`
+        (в списке ответственного только `confirmed`, а после отметки — `used`).
+      required: [id, resource, start, end, status, owner, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        resource:
+          $ref: '#/components/schemas/Resource'
+        start:
+          type: string
+          format: date-time
+          description: В часовом поясе организации
+        end:
+          type: string
+          format: date-time
+        status:
+          $ref: '#/components/schemas/BookingStatus'
+        owner:
+          type: object
+          required: [name]
+          description: Кто забронировал — чтобы ответственный знал, кого отмечать. Email и другие данные не передаются
+          properties:
+            name:
+              type: string
+              example: Иванов Иван
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    ManagedBookingPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ManagedBooking'
         nextCursor:
           type: string
           nullable: true
