@@ -548,10 +548,11 @@ components:
 
     BookingStatus:
       type: string
-      enum: [requested, confirmed, rejected, timed_out, cancelled, used, expired]
+      enum: [requested, confirmed, rejected, timed_out, cancelled, used, expired, check_failed]
       description: |
         `requested` — Запрошена, `confirmed` — Подтверждена, `rejected` — Отклонена, `timed_out` — Просрочена,
-        `cancelled` — Отменена, `used` — Использована, `expired` — Истекла. Переходы — docs/job-states.md.
+        `cancelled` — Отменена, `used` — Использована, `expired` — Истекла, `check_failed` — Проверка не удалась.
+        Переходы — docs/job-states.md.
 
     ReasonCode:
       type: string

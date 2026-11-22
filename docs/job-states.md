@@ -12,6 +12,7 @@ Job — бронь одного ресурса на интервал `[start, en
 | Отменена | `cancelled` | да | нет |
 | Использована | `used` | да | да, до окончания интервала |
 | Истекла | `expired` | да | нет |
+| Проверка не удалась | `check_failed` | да | нет |
 
 ## Диаграмма
 
@@ -22,6 +23,7 @@ stateDiagram-v2
     requested --> confirmed : Dispatcher, все правила прошли, до start
     requested --> rejected : Dispatcher, правило отказало, до start
     requested --> timed_out : TimerWorker, наступил start
+    requested --> check_failed : Dispatcher, правило упало 3 раза подряд
 
     confirmed --> cancelled : владелец, POST cancel, до start
     confirmed --> used : ответственный, POST check-in, от start до end
@@ -32,6 +34,7 @@ stateDiagram-v2
     cancelled --> [*]
     used --> [*]
     expired --> [*]
+    check_failed --> [*]
 ```
 
 Подписи стрелок: кто выполняет переход и условие на момент сохранения. Все переходы выполняются условным
@@ -45,6 +48,7 @@ stateDiagram-v2
 | `requested` | `confirmed` | Dispatcher | Все `IBookingRule` вернули `Pass`, время < `start` | Подтверждение |
 | `requested` | `rejected` | Dispatcher | Хотя бы одно правило вернуло `Reject`, время < `start` | Отклонение с причиной |
 | `requested` | `timed_out` | TimerWorker | Время ≥ `start`, результат проверки не зафиксирован | Нет |
+| `requested` | `check_failed` | Dispatcher | Правило третий раз подряд упало с ошибкой в коде (не `RuleUnavailableException`) | Нет |
 | `confirmed` | `cancelled` | Владелец через API | Время < `start` | Отмена |
 | `confirmed` | `used` | Ответственный через API | `start` ≤ время < `end` | Нет |
 | `confirmed` | `expired` | TimerWorker | Время ≥ `end` | Истечение |
@@ -99,6 +103,24 @@ stateDiagram-v2
 состояние уже не `confirmed` → `invalid_state` (или `200`, если это повтор шага 2, например параллельная отмена
 успела раньше), иначе — код нарушенного окна времени.
 
-В доменном ядре недопустимый переход даёт `InvalidTransitionException(from, to)`. HTTP-слой переводит его в
+## Проверка в ядре: одна за раз
+
+Внутри `requested` Job помнит, идёт ли проверка (`IsCheckRunning`) и её номер (`CheckAttempt`). Команды ядра
+(`src/ResourceBooking.Core/Bookings/BookingTransitions.cs`):
+
+| Команда | Из | В | Дополнительное условие |
+|---|---|---|---|
+| `BeginCheck` | `requested` | `requested` | Проверка не идёт; номер проверки +1 |
+| `Confirm` / `Reject` | `requested` | `confirmed` / `rejected` | Идёт проверка с этим номером |
+| `FailCheck` | `requested` | `requested` или `check_failed` | Идёт проверка с этим номером; на 3-м падении — `check_failed` |
+| `ReleaseCheck` | `requested` | `requested` | Временный сбой или остановка: попытка не засчитывается |
+| `RecoverAfterRestart` | `requested` | `requested` | Снимает пропавшую при перезапуске проверку |
+| `TimeOut` | `requested` | `timed_out` | Проходит и во время проверки |
+| `Cancel` / `CheckIn` / `Expire` | `confirmed` | `cancelled` / `used` / `expired` | — |
+
+Итог устаревшей проверки (после перезапуска, повтора или таймаута) Job отклоняет — так ядро не пропускает
+двойную работу, два итога и «вечную работу» (злодейства З1, З2, З4).
+
+В доменном ядре недопустимый переход даёт `InvalidTransitionException(command, from)`. HTTP-слой переводит его в
 `409 invalid_state`, а нарушение временного окна — в соответствующий код `cancel_window_closed`, `check_in_too_early`
 или `check_in_window_closed`.

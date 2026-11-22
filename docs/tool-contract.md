@@ -130,6 +130,9 @@ Tool получает только уже проверенные парамет�
 ```csharp
 public interface IBookingRuleRegistry
 {
+    /// Tool по имени операции (Code). Неизвестное имя — UnknownOperationException, код unknown_operation.
+    IBookingRule Get(string code);
+
     /// Все правила в порядке Order. Пустой список — ошибка конфигурации, приложение не стартует.
     IReadOnlyList<IBookingRule> GetRules();
 }
