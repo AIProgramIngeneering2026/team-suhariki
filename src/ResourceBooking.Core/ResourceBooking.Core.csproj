@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Доменное ядро РесурсБрони: Job, Registry, Dispatcher, Tool.
+    Намеренно без PackageReference: ни веб-фреймворка, ни драйвера БД (требование п. 5 практики 3).
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>ResourceBooking.Core</RootNamespace>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="ResourceBooking.Core.Tests" />
+  </ItemGroup>
+
+</Project>
